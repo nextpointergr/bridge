@@ -1,0 +1,37 @@
+{
+  "name": "nextpointer/bridge",
+  "description": "Universal Data Integration Bridge for Laravel. A framework to sync external sources (ERP, E-shops, APIs) to local models.",
+  "keywords": ["laravel", "bridge", "sync", "integration", "erp", "prestashop"],
+  "license": "MIT",
+  "authors": [
+    {
+      "name": "Nextpointer",
+      "email": "info@nextpointer.gr"
+    }
+  ],
+  "require": {
+    "php": "^8.1",
+    "illuminate/support": "^10|^11|^12|^13",
+    "illuminate/http": "^10|^11|^12|^13",
+    "illuminate/database": "^10.0|^11.0|^12|^13",
+    "illuminate/bus": "^10.0|^11.0|^12|^13",
+    "illuminate/queue": "^10.0|^11.0|^12|^13"
+  },
+  "autoload": {
+    "psr-4": {
+      "Nextpointer\\Bridge\\": "src/"
+    }
+  },
+  "extra": {
+    "laravel": {
+      "providers": [
+        "Nextpointer\\Bridge\\BridgeServiceProvider"
+      ],
+      "aliases": {
+        "Bridge": "Nextpointer\\Bridge\\Facades\\Bridge"
+      }
+    }
+  },
+  "minimum-stability": "stable",
+  "prefer-stable": true
+}
