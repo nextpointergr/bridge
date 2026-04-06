@@ -5,12 +5,13 @@ namespace Nextpointer\Bridge\Events; // <--- Πρέπει να είναι ακρ
 use Illuminate\Broadcasting\Channel;
 use Illuminate\Broadcasting\InteractsWithSockets;
 use Illuminate\Contracts\Broadcasting\ShouldBroadcast;
+use Illuminate\Contracts\Broadcasting\ShouldBroadcastNow;
 use Illuminate\Foundation\Events\Dispatchable;
 use Illuminate\Queue\SerializesModels;
 
-class BridgeSyncProgressUpdated implements ShouldBroadcast
+class BridgeSyncProgressUpdated implements ShouldBroadcastNow
 {
-    use Dispatchable, InteractsWithSockets, SerializesModels;
+    use Dispatchable, SerializesModels;
 
     public function __construct(
         public string $source,
@@ -18,14 +19,14 @@ class BridgeSyncProgressUpdated implements ShouldBroadcast
         public int $batchId,
         public int $processed,
         public int $total,
-        public bool $isCompleted = false
+        public bool $isCompleted = false,
+        public string $phase = 'fetching',
+        public $message = ''
     ) {}
 
-    public function broadcastOn(): array
+    public function broadcastOn(): Channel
     {
-        return [
-            new Channel("bridge-sync.{$this->batchId}"),
-        ];
+        return new Channel('sync');
     }
 
     public function broadcastAs(): string

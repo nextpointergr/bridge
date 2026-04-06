@@ -2,6 +2,7 @@
 
 namespace Nextpointer\Bridge\Jobs;
 
+use Illuminate\Bus\Batchable; // <--- ΠΡΟΣΘΕΣΕ ΑΥΤΟ
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Bus\Dispatchable;
@@ -13,7 +14,8 @@ use Illuminate\Support\Facades\DB;
 
 class SyncDispatcher implements ShouldQueue
 {
-    use Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
+    // Πρόσθεσε το Batchable trait εδώ
+    use Dispatchable, InteractsWithQueue, Queueable, SerializesModels, Batchable;
 
     public function __construct(
         public string $source,
@@ -23,6 +25,10 @@ class SyncDispatcher implements ShouldQueue
 
     public function handle(): void
     {
+        if ($this->batch()?->cancelled()) {
+            return;
+        }
+
         $lockKey = "bridge_lock_{$this->source}_{$this->entity}";
         $lock = Cache::lock($lockKey, 3600);
 
@@ -31,7 +37,8 @@ class SyncDispatcher implements ShouldQueue
             return;
         }
 
-        $batchId = DB::table(config('bridge.tables.batches'))->insertGetId([
+        // Αυτό είναι το ID του δικού μας πίνακα sync_batches
+        $internalBatchId = DB::table(config('bridge.tables.batches'))->insertGetId([
             'source'     => $this->source,
             'entity'     => $this->entity,
             'status'     => 'running',
@@ -40,6 +47,18 @@ class SyncDispatcher implements ShouldQueue
             'updated_at' => now(),
         ]);
 
-        UniversalSyncJob::dispatch($this->source, $this->entity, $batchId, $this->fullSync);
+        // Προσοχή: Περνάμε το $internalBatchId στη θέση της παραμέτρου $syncBatchId
+        $job = new UniversalSyncJob(
+            source: $this->source,
+            entity: $this->entity,
+            syncBatchId: $internalBatchId, // Χρήση του νέου ονόματος
+            fullSync: $this->fullSync
+        );
+
+        if ($this->batch()) {
+            $this->batch()->add($job);
+        } else {
+            dispatch($job);
+        }
     }
 }

@@ -11,4 +11,7 @@ interface SyncMapper {
     public function beforeSync(array &$mapped): void;
     public function afterSync(array $originalRow, Model $modelInstance): void;
     public function getHashFields(): array;
+    public function useStaging(): bool;
+    public function syncByDate(): bool; // <--- Επιστρέφει true αν θέλουμε φίλτρο ημερομηνίας
+    public function getBatchLimit(): int; // <--- Πρόσθεσε αυτό
 }

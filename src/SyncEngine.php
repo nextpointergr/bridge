@@ -2,157 +2,222 @@
 
 namespace Nextpointer\Bridge;
 
-use Exception;
 use Illuminate\Support\Facades\DB;
-use Nextpointer\Bridge\Contracts\SyncMapper;
+use Illuminate\Support\Facades\Log;
+use Exception;
 
 class SyncEngine
 {
     /**
-     * Η κύρια μέθοδος εκτέλεσης του συγχρονισμού για ένα batch δεδομένων.
+     * ΦΑΣΗ 1: RUN (API -> TARGET)
+     * Mapping των δεδομένων και αποθήκευση είτε στον Staging είτε απευθείας στο Live.
      */
     public function run(string $source, string $entity, array $rows, int $batchId = 0): array
     {
         $config = config("bridge.sources.{$source}.entities.{$entity}");
-
-        if (!$config) {
-            throw new Exception("Bridge: Entity [{$entity}] for source [{$source}] is not configured.");
-        }
-
         $mapper = app($config['mapper']);
-        $model = $config['model'];
+        $model = new $config['model'];
 
+        // ΔΥΝΑΜΙΚΟΣ ΠΡΟΟΡΙΣΜΟΣ: Staging ή Live table;
+        $useStaging = $mapper->useStaging();
+        $targetTable = $useStaging ? "staging_" . $model->getTable() : $model->getTable();
+
+        $idField = $mapper->getIdentifierField();
         $payload = [];
-        $exceptions = [];
         $processedIds = [];
 
         foreach ($rows as $row) {
-            $remoteId = (string)($row['id'] ?? '0');
-            $processedIds[] = $remoteId;
-
-            // 1. Mapping & Before Hook (Μετατροπή δεδομένων)
             $mapped = $mapper->map($row);
             $mapper->beforeSync($mapped);
 
-            // 2. Custom Validation (Exceptions / Quarantine)
-            if ($reason = $mapper->validate($mapped)) {
-                $exceptions[] = [
-                    'source'     => $source,
-                    'entity'     => $entity,
-                    'remote_id'  => $remoteId,
-                    'reason'     => $reason,
-                    'payload'    => json_encode($mapped),
-                    'created_at' => now(),
-                    'updated_at' => now(),
-                ];
-                continue;
-            }
-
-            // 3. Smart Hashing (Έλεγχος αν άλλαξε το record)
-            $hashFields = $mapper->getHashFields();
-            $dataToHash = !empty($hashFields)
-                ? array_intersect_key($mapped, array_flip($hashFields))
-                : $mapped;
-
-            // Αφαιρούμε timestamps από το hash για να μην κάνει update άσκοπα
-            unset($dataToHash['hash'], $dataToHash['updated_at'], $dataToHash['created_at']);
-
-            $mapped['hash'] = md5(json_encode($dataToHash));
+            $mapped['source'] = $source;
             $mapped['updated_at'] = now();
-            if (!isset($mapped['created_at'])) {
-                $mapped['created_at'] = now();
-            }
+            $mapped['created_at'] = $mapped['created_at'] ?? now();
+            $mapped['deleted_at'] = null;
+            $hashFields = $mapper->getHashFields();
+            $dataToHash = !empty($hashFields) ? array_intersect_key($mapped, array_flip($hashFields)) : $mapped;
+            unset($dataToHash['hash'], $dataToHash['updated_at'], $dataToHash['created_at'], $dataToHash['deleted_at'], $dataToHash['source']);
+            $mapped['hash'] = md5(json_encode($dataToHash));
 
             $payload[] = $mapped;
+            $processedIds[] = (string)$mapped[$idField];
         }
 
-        // 4. Database Persistence (Upsert & Activities)
-        $this->persist($model, $mapper, $payload, $exceptions, $source, $entity, $batchId, $rows);
+        if (!empty($payload)) {
+            foreach (array_chunk($payload, 500) as $chunk) {
+                // Γράφουμε στον πίνακα που αποφασίστηκε (Target Table)
+                DB::table($targetTable)->upsert($chunk, [$idField], $mapper->getUpdateColumns());
+
+                $msg = $useStaging ? "Προετοιμασία στο Stage: " : "Συγχρονισμός: ";
+                broadcast(new \Nextpointer\Bridge\Events\BridgeSyncProgressUpdated(
+                    $source, $entity, $batchId, 0, 0, false, 'fetching',
+                    $msg . count($chunk) . " εγγραφές..."
+                ));
+            }
+
+            // Αν είναι Direct Sync (όχι staging), καταγράφουμε και τα Activities εδώ
+            if (!$useStaging && $batchId > 0) {
+                $this->logActivities($batchId, $source, $entity, $payload, $config['model'], $idField);
+            }
+        }
 
         return $processedIds;
     }
 
     /**
-     * Αποθήκευση στη βάση με Database Transaction.
+     * ΦΑΣΗ 2: FINALIZE (STAGING -> LIVE)
+     * Εκτελείται ΜΟΝΟ αν η οντότητα χρησιμοποιεί Staging.
      */
-    protected function persist($model, $mapper, $payload, $exceptions, $source, $entity, $batchId, $rows): void
+    public function finalize(string $source, string $entity, int $batchId = 0): int
     {
-        DB::transaction(function () use ($model, $mapper, $payload, $exceptions, $source, $entity, $batchId, $rows) {
-            $tables = config('bridge.tables');
+        $config = config("bridge.sources.{$source}.entities.{$entity}");
+        $mapper = app($config['mapper']);
 
-            // --- Αποθήκευση Έγκυρων Δεδομένων (Upsert) ---
-            if (!empty($payload)) {
-                $model::upsert($payload, [$mapper->getUniqueKey()], $mapper->getUpdateColumns());
+        // Αν κάποιος την καλέσει κατά λάθος για Direct οντότητα, σταματάμε.
+        if (!$mapper->useStaging()) return 0;
 
-                // Καταγραφή Activities (Logs) αν υπάρχει Batch ID
-                if ($batchId > 0) {
-                    $this->logActivities($batchId, $source, $entity, $payload, $mapper->getUniqueKey());
+        $modelClass = $config['model'];
+        $liveTable = (new $modelClass)->getTable();
+        $stagingTable = "staging_" . $liveTable;
+
+        $uniqueKey = $mapper->getUniqueKey();
+        $idField = $mapper->getIdentifierField();
+
+        $totalRecords = DB::table($stagingTable)->count();
+        $processedCount = 0;
+
+        // Προ-εντοπισμός διπλοτύπων
+        $duplicateValues = DB::table($stagingTable)
+            ->select($uniqueKey)
+            ->whereNotNull($uniqueKey)
+            ->where($uniqueKey, '!=', '')
+            ->groupBy($uniqueKey)
+            ->havingRaw('COUNT(*) > 1')
+            ->pluck($uniqueKey)
+            ->toArray();
+
+        broadcast(new \Nextpointer\Bridge\Events\BridgeSyncProgressUpdated(
+            $source, $entity, $batchId, 0, $totalRecords, false, 'finalizing',
+            "Έναρξη ελέγχου εγκυρότητας και διπλοτύπων..."
+        ));
+
+        while (true) {
+            $records = DB::table($stagingTable)->orderBy($idField)->limit(500)->get();
+            if ($records->isEmpty()) break;
+
+            $validPayload = [];
+            $exceptions = [];
+            $processedIds = [];
+
+            foreach ($records as $record) {
+                $recordArray = (array)$record;
+                $processedIds[] = $recordArray[$idField];
+                $currentVal = $recordArray[$uniqueKey] ?? null;
+                $reason = null;
+
+                if ($currentVal && in_array($currentVal, $duplicateValues)) {
+                    $reason = "duplicate_{$uniqueKey}_detected";
+                } else {
+                    $reason = $mapper->validate($recordArray);
                 }
 
-                // Trigger AfterSync Hook
-                $this->triggerAfterSync($model, $mapper, $payload, $rows);
+                if ($reason) {
+                    $exceptions[] = [
+                        'source'     => $source,
+                        'entity'     => $entity,
+                        'identifier' => (string)$recordArray[$idField],
+                        'reason'     => $reason,
+                        'payload'    => json_encode($recordArray),
+                        'created_at' => now(),
+                        'updated_at' => now()
+                    ];
+                } else {
+                    $validPayload[] = $recordArray;
+                }
             }
 
-            // --- Διαχείριση Εξαιρέσεων (Exceptions / Quarantine) ---
-            if (!empty($exceptions)) {
-                DB::table($tables['exceptions'])->upsert(
-                    $exceptions,
-                    ['source', 'entity', 'remote_id'],
-                    ['payload', 'reason', 'updated_at']
-                );
-            }
+            $this->persist($modelClass, $mapper, $validPayload, $exceptions, $source, $entity, $batchId);
+            DB::table($stagingTable)->whereIn($idField, $processedIds)->delete();
 
-            // Καθαρισμός επιτυχημένων από τις εξαιρέσεις (αν υπήρχαν πριν)
+            $processedCount += $records->count();
+            broadcast(new \Nextpointer\Bridge\Events\BridgeSyncProgressUpdated(
+                $source, $entity, $batchId, $processedCount, $totalRecords, false, 'finalizing',
+                "Μεταφορά στο Production: " . number_format($processedCount) . " / " . number_format($totalRecords)
+            ));
+        }
+
+        return $totalRecords;
+    }
+
+    /**
+     * Persist με Transaction
+     */
+    protected function persist($modelClass, $mapper, $payload, $exceptions, $source, $entity, $batchId): void
+    {
+        $tables = config('bridge.tables');
+        $idField = $mapper->getIdentifierField();
+        $tableName = (new $modelClass)->getTable();
+
+        DB::transaction(function () use ($modelClass, $mapper, $payload, $exceptions, $source, $entity, $batchId, $tables, $idField, $tableName) {
             if (!empty($payload)) {
-                $uniqueKeys = array_column($payload, $mapper->getUniqueKey());
-                DB::table($tables['exceptions'])
-                    ->where('source', $source)
-                    ->where('entity', $entity)
-                    ->whereIn('remote_id', $uniqueKeys)
-                    ->delete();
+                $validIds = array_column($payload, $idField);
+                DB::table($tables['exceptions'])->where('source', $source)->where('entity', $entity)->whereIn('identifier', $validIds)->delete();
+
+                foreach (array_chunk($payload, 500) as $chunk) {
+                    $modelClass::upsert($chunk, [$idField], $mapper->getUpdateColumns());
+                }
+
+                if ($batchId > 0) {
+                    $this->logActivities($batchId, $source, $entity, $payload, $modelClass, $idField);
+                }
+            }
+
+            if (!empty($exceptions)) {
+                foreach ($exceptions as $ex) {
+                    DB::table($tables['exceptions'])->updateOrInsert(
+                        ['source' => $source, 'entity' => $entity, 'identifier' => $ex['identifier']],
+                        ['reason' => $ex['reason'], 'payload' => $ex['payload'], 'updated_at' => now(), 'created_at' => now()]
+                    );
+                    if (method_exists($modelClass, 'bootSoftDeletes')) {
+                        DB::table($tableName)->where($idField, $ex['identifier'])->update(['deleted_at' => now()]);
+                    }
+                }
             }
         });
     }
 
     /**
-     * Καταγραφή των ενεργειών στον πίνακα Activities.
+     * Log Activities
      */
-    protected function logActivities(int $batchId, string $source, string $entity, array $payload, string $key): void
+    protected function logActivities($batchId, $source, $entity, $payload, $modelClass, $key): void
     {
+        $existingRecords = $modelClass::withTrashed()
+            ->whereIn($key, array_column($payload, $key))
+            ->get()
+            ->keyBy($key);
+
         $activities = [];
-        foreach ($payload as $item) {
+        foreach ($payload as $newItem) {
+            $id = (string)$newItem[$key];
+            $oldItem = $existingRecords[$id] ?? null;
+            $action = $oldItem ? ($oldItem->trashed() ? 'restored' : 'updated') : 'created';
+
+            if ($action === 'updated' && ($oldItem->hash ?? null) === $newItem['hash']) continue;
+
             $activities[] = [
-                'batch_id'   => $batchId,
-                'source'     => $source,
-                'entity'     => $entity,
-                'identifier' => (string)$item[$key],
-                'action'     => 'synced', // Μπορείς να το κάνεις πιο advanced με diff
-                'changes'    => json_encode(['hash' => $item['hash']]),
-                'created_at' => now(),
+                'batch_id' => $batchId,
+                'source' => $source,
+                'entity' => $entity,
+                'identifier' => $id,
+                'action' => $action,
+                'changes' => null,
+                'created_at' => now()
             ];
         }
 
         if (!empty($activities)) {
-            DB::table(config('bridge.tables.activities'))->insert($activities);
-        }
-    }
-
-    /**
-     * Εκτέλεση του afterSync hook για κάθε μοντέλο που επηρεάστηκε.
-     */
-    protected function triggerAfterSync($model, $mapper, $payload, $rows): void
-    {
-        $key = $mapper->getUniqueKey();
-        $syncedModels = $model::whereIn($key, array_column($payload, $key))
-            ->get()
-            ->keyBy($key);
-
-        foreach ($rows as $originalRow) {
-            $mappedData = $mapper->map($originalRow);
-            $uVal = $mappedData[$key] ?? null;
-
-            if ($uVal && isset($syncedModels[$uVal])) {
-                $mapper->afterSync($originalRow, $syncedModels[$uVal]);
+            foreach (array_chunk($activities, 500) as $chunk) {
+                DB::table(config('bridge.tables.activities'))->insert($chunk);
             }
         }
     }
