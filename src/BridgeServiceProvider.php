@@ -20,23 +20,20 @@ class BridgeServiceProvider extends ServiceProvider
         $this->app->alias(SyncEngine::class, 'bridge-engine');
     }
 
-    public function boot()
-    {
-        // 1. Αυτόματη φόρτωση των Migrations από το πακέτο
-        $this->loadMigrationsFrom(__DIR__.'/../database/migrations');
+   public function boot()
+{
+    // Επειδή ο Provider είναι στο src/ και τα migrations στο src/database/migrations
+    $this->loadMigrationsFrom(__DIR__.'/database/migrations');
 
-        if ($this->app->runningInConsole()) {
-            
-            // 2. Δυνατότητα για Publish του Config
-            $this->publishes([
-                __DIR__.'/../config/bridge.php' => config_path('bridge.php'),
-            ], 'bridge-config');
-
-            // 3. (Προαιρετικά) Δυνατότητα για Publish των Migrations 
-            // αν ο χρήστης θέλει να τα πειράξει χειροκίνητα
-            $this->publishes([
-                __DIR__.'/../database/migrations/' => database_path('migrations')
-            ], 'bridge-migrations');
-        }
+    if ($this->app->runningInConsole()) {
+        // Αντίστοιχη διόρθωση και για το publish
+        $this->publishes([
+            __DIR__.'/database/migrations' => database_path('migrations'),
+        ], 'bridge-migrations');
+        
+        $this->publishes([
+            __DIR__.'/../config/bridge.php' => config_path('bridge.php'),
+        ], 'bridge-config');
     }
+}
 }
