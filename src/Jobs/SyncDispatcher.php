@@ -9,7 +9,7 @@ use Illuminate\Queue\InteractsWithQueue;
 use Illuminate\Queue\SerializesModels;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Log;
-use DB;
+use Illuminate\Support\Facades\DB;
 
 class SyncDispatcher implements ShouldQueue
 {
@@ -24,14 +24,13 @@ class SyncDispatcher implements ShouldQueue
     public function handle(): void
     {
         $lockKey = "bridge_lock_{$this->source}_{$this->entity}";
-        $lock = Cache::lock($lockKey, 3600); // Lock για 1 ώρα
+        $lock = Cache::lock($lockKey, 3600);
 
         if (!$lock->get()) {
             Log::info("Bridge: Sync already running for {$this->source}:{$this->entity}");
             return;
         }
 
-        // Δημιουργία του Batch στον πίνακα sync_batches
         $batchId = DB::table(config('bridge.tables.batches'))->insertGetId([
             'source'     => $this->source,
             'entity'     => $this->entity,
@@ -41,12 +40,6 @@ class SyncDispatcher implements ShouldQueue
             'updated_at' => now(),
         ]);
 
-        // Dispatch του εργάτη
-        UniversalSyncJob::dispatch(
-            $this->source,
-            $this->entity,
-            $batchId,
-            $this->fullSync
-        );
+        UniversalSyncJob::dispatch($this->source, $this->entity, $batchId, $this->fullSync);
     }
 }

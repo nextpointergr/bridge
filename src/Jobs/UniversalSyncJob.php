@@ -7,46 +7,78 @@ use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Bus\Dispatchable;
 use Illuminate\Queue\InteractsWithQueue;
 use Illuminate\Queue\SerializesModels;
+use Nextpointer\Bridge\SyncEngine;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Cache;
-use Illuminate\Support\Facades\Log;
-use DB;
+use Nextpointer\Bridge\Events\BridgeSyncProgressUpdated;
 
-class SyncDispatcher implements ShouldQueue
+class UniversalSyncJob implements ShouldQueue
 {
     use Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
 
     public function __construct(
         public string $source,
         public string $entity,
-        public bool $fullSync = false
+        public int $batchId,
+        public bool $fullSync = false,
+        public int $offset = 0,
+        public int $limit = 500
     ) {}
 
-    public function handle(): void
+    public function handle(SyncEngine $engine): void
     {
-        $lockKey = "bridge_lock_{$this->source}_{$this->entity}";
-        $lock = Cache::lock($lockKey, 3600); // Lock για 1 ώρα
+        $config = config("bridge.sources.{$this->source}");
+        $provider = app($config['provider'])->setEntity($this->entity);
+        $tables = config('bridge.tables');
+        $since = null;
 
-        if (!$lock->get()) {
-            Log::info("Bridge: Sync already running for {$this->source}:{$this->entity}");
-            return;
+        // Incremental logic
+        if (!$this->fullSync) {
+            $lastBatch = DB::table($tables['batches'])
+                ->where('source', $this->source)
+                ->where('entity', $this->entity)
+                ->where('status', 'completed')
+                ->latest('finished_at')
+                ->first();
+            $since = $lastBatch?->finished_at;
         }
 
-        // Δημιουργία του Batch στον πίνακα sync_batches
-        $batchId = DB::table(config('bridge.tables.batches'))->insertGetId([
-            'source'     => $this->source,
-            'entity'     => $this->entity,
-            'status'     => 'running',
-            'started_at' => now(),
-            'created_at' => now(),
-            'updated_at' => now(),
+        while (true) {
+            $response = $provider->fetchData($this->offset, $this->limit, $since);
+            $rows = $response['data'] ?? [];
+            $total = $response['total'] ?? 0;
+
+            if ($this->offset === 0) {
+                DB::table($tables['batches'])->where('id', $this->batchId)->update(['total' => $total]);
+            }
+
+            if (empty($rows)) break;
+
+            // Εκτέλεση Engine (Mapping & Upsert)
+            $engine->run($this->source, $this->entity, $rows, $this->batchId);
+
+            $this->offset += count($rows);
+
+            DB::table($tables['batches'])->where('id', $this->batchId)->increment('processed', count($rows));
+
+            // Broadcast Progress
+            broadcast(new BridgeSyncProgressUpdated(
+                $this->source, $this->entity, $this->batchId, $this->offset, $total, false
+            ));
+
+            if (count($rows) < $this->limit) break;
+        }
+
+        // Ολοκλήρωση
+        DB::table($tables['batches'])->where('id', $this->batchId)->update([
+            'status' => 'completed',
+            'finished_at' => now()
         ]);
 
-        // Dispatch του εργάτη
-        UniversalSyncJob::dispatch(
-            $this->source,
-            $this->entity,
-            $batchId,
-            $this->fullSync
-        );
+        broadcast(new BridgeSyncProgressUpdated(
+            $this->source, $this->entity, $this->batchId, $this->offset, $this->offset, true
+        ));
+
+        Cache::lock("bridge_lock_{$this->source}_{$this->entity}")->forceRelease();
     }
 }
