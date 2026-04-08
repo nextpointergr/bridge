@@ -2,7 +2,7 @@
 namespace Nextpointer\Bridge\Contracts;
 use Illuminate\Database\Eloquent\Model;
 
-interface SyncMapper {
+interface BridgeResource {
     public function getModel(): string;
     public function getUniqueKey(): string;
     public function getUpdateColumns(): array;
@@ -12,6 +12,10 @@ interface SyncMapper {
     public function afterSync(array $originalRow, Model $modelInstance): void;
     public function getHashFields(): array;
     public function useStaging(): bool;
-    public function syncByDate(): bool; // <--- Επιστρέφει true αν θέλουμε φίλτρο ημερομηνίας
-    public function getBatchLimit(): int; // <--- Πρόσθεσε αυτό
+    public function syncByDate(): bool;
+    public function getBatchLimit(): int;
+    public function shouldLog(): bool;
+    public function shouldCleanup(): bool;
+    public function forceFullSync(): bool;
+    public function only(): ?array; // <--- Πρόσθεσε αυτό
 }

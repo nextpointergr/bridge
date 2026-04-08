@@ -11,11 +11,10 @@ class BridgeServiceProvider extends ServiceProvider
         // Merge το config για να είναι προσβάσιμο μέσω config('bridge')
         $this->mergeConfigFrom(__DIR__.'/../config/bridge.php', 'bridge');
 
-        // Bind την Engine ως Singleton
         $this->app->singleton(SyncEngine::class, function ($app) {
             return new SyncEngine();
         });
-        
+
         // Alias για το Facade
         $this->app->alias(SyncEngine::class, 'bridge-engine');
     }
@@ -30,10 +29,14 @@ class BridgeServiceProvider extends ServiceProvider
         $this->publishes([
             __DIR__.'/database/migrations' => database_path('migrations'),
         ], 'bridge-migrations');
-        
+
         $this->publishes([
             __DIR__.'/../config/bridge.php' => config_path('bridge.php'),
         ], 'bridge-config');
+
+        $this->publishes([
+            __DIR__.'/Resources/DemoResource.php' => app_path('Sync/Resources/DemoResource.php'),
+        ], 'bridge-resources');
     }
 }
 }

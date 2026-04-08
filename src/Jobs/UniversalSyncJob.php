@@ -34,16 +34,21 @@ class UniversalSyncJob implements ShouldQueue
         $entityConfig = $config['entities'][$this->entity];
         $mapper = app($entityConfig['mapper']); // Φέρνουμε τον Mapper
         $limit = $mapper->getBatchLimit();
+        $isFullSync = $mapper->forceFullSync() ?: $this->fullSync;
 
         $provider = app($config['provider'])->setEntity($this->entity);
+        if (method_exists($mapper, 'only') && !empty($mapper->only())) {
+            $provider->setOnly($mapper->only());
+        }
+
         $tables = config('bridge.tables');
         $since = null;
-
+        $allProcessedIds = [];
         // Έλεγχος αν η οντότητα απαιτεί Staging
         $useStaging = $mapper->useStaging();
 
         // 1. Προσδιορισμός Incremental Sync
-        if ($mapper->syncByDate() && !$this->fullSync) {
+        if ($mapper->syncByDate() && !$isFullSync) {
             $lastBatch = DB::table($tables['batches'])
                 ->where('source', $this->source)
                 ->where('entity', $this->entity)
@@ -57,6 +62,7 @@ class UniversalSyncJob implements ShouldQueue
         $firstRun = true;
         $total = 0;
 
+
         while (true) {
             $response = $provider->fetchData($this->offset, $limit, $since);
             $rows = $response['data'] ?? [];
@@ -66,6 +72,7 @@ class UniversalSyncJob implements ShouldQueue
                 DB::table($tables['batches'])->where('id', $this->syncBatchId)->update(['total' => $total]);
 
                 if ($total === 0 || empty($rows)) {
+
                     $this->completeBatch($tables['batches'], 0, "Το σύστημα είναι ήδη ενημερωμένο.");
                     return;
                 }
@@ -77,9 +84,9 @@ class UniversalSyncJob implements ShouldQueue
 
             if (empty($rows)) break;
 
-            // Mapping & Upsert (Η run() πλέον ξέρει αν θα πάει Staging ή Live μέσω του Mapper)
-            $engine->run($this->source, $this->entity, $rows, $this->syncBatchId);
-
+            // 2. ΕΔΩ ΜΑΖΕΥΕΙΣ ΤΑ IDS ΠΟΥ ΕΡΧΟΝΤΑΙ ΑΠΟ ΤΗ RUN
+            $currentBatchIds = $engine->run($this->source, $this->entity, $rows, $this->syncBatchId);
+            $allProcessedIds = array_merge($allProcessedIds, $currentBatchIds);
             $this->offset += count($rows);
             $displayProcessed = ($total > 0 && $this->offset > $total) ? $total : $this->offset;
 
@@ -88,8 +95,11 @@ class UniversalSyncJob implements ShouldQueue
             ]);
 
             $this->notify("Επεξεργασία: $displayProcessed / $total", $displayProcessed, $total, 'fetching');
-
             if (count($rows) < $limit || $this->offset >= $total) break;
+        }
+
+        if ($isFullSync && $mapper->shouldCleanup()) {
+            $engine->cleanup($this->source, $this->entity, $allProcessedIds, $this->syncBatchId);
         }
 
 

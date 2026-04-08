@@ -37,7 +37,6 @@ class SyncDispatcher implements ShouldQueue
             return;
         }
 
-        // Αυτό είναι το ID του δικού μας πίνακα sync_batches
         $internalBatchId = DB::table(config('bridge.tables.batches'))->insertGetId([
             'source'     => $this->source,
             'entity'     => $this->entity,
