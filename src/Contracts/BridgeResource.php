@@ -16,6 +16,9 @@ interface BridgeResource {
     public function getBatchLimit(): int;
     public function shouldLog(): bool;
     public function shouldCleanup(): bool;
+    public function getIdentifierField();
+    public function getDbChunkSize(): int; // <--- Πρόσθεσε αυτό για τη βάση
     public function forceFullSync(): bool;
     public function only(): ?array; // <--- Πρόσθεσε αυτό
+    public function getLiveColumns(): array;
 }

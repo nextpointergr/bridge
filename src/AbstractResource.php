@@ -20,6 +20,8 @@ abstract class AbstractResource implements BridgeResource
     public function forceFullSync(): bool { return false; }
     public function only(): ?array { return null; }
 
+
+
     /**
      * Default Hooks (Κενά).
      */
@@ -36,4 +38,20 @@ abstract class AbstractResource implements BridgeResource
     abstract public function getUpdateColumns(): array;
     abstract public function map(array $row): array;
     abstract public function getHashFields(): array;
+    public function getDbChunkSize(): int
+    {
+        return 500; // Default τιμή
+    }
+
+    public function getLiveColumns(): array
+    {
+        return array_unique(array_merge($this->getUpdateColumns(), [
+            $this->getIdentifierField(),
+            'source',
+            'hash',
+            'created_at',
+            'updated_at',
+            'deleted_at'
+        ]));
+    }
 }

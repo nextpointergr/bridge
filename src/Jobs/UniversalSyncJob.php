@@ -23,7 +23,7 @@ class UniversalSyncJob implements ShouldQueue
         public int $syncBatchId,
         public bool $fullSync = false,
         public int $offset = 0,
-        public int $limit = 500
+        public int $limit = 1500
     ) {}
 
     public function handle(SyncEngine $engine): void
